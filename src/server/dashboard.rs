@@ -102,6 +102,7 @@ section:last-of-type{margin-bottom:24px}
 .eng[data-accent="amber"] .tog.on{box-shadow:0 0 0 3px rgba(217,119,6,.20)}
 .eng[data-accent="violet"] .tog.on{box-shadow:0 0 0 3px rgba(124,58,237,.20)}
 .eng[data-accent="green"] .tog.on{box-shadow:0 0 0 3px rgba(22,163,74,.20)}
+.tog.disabled{opacity:.4;pointer-events:none;cursor:not-allowed;filter:grayscale(1)}
 .thumb{position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .25s var(--ease);box-shadow:0 1px 3px rgba(15,23,42,.30)}
 .tog.on .thumb{transform:translateX(20px)}
 .tog.bounce .thumb{animation:bounce .35s var(--ease)}
@@ -310,10 +311,10 @@ code{font-family:var(--mono);font-size:.9em;padding:1px 6px;border-radius:4px;ba
     <div class="cctl" data-tip-pos="top" data-tip="Phase 2a. Exact-match response cache keyed by&#10;SHA-256 of normalized request body. Skips upstream&#10;on identical replays. Off by default.">
       <div class="cctl-text">
         <span class="cctl-label">L1 exact-match cache</span>
-        <span class="cctl-sub">SHA-256 of normalized request → response. Replays skip upstream entirely.</span>
+        <span class="cctl-sub">Disabled — exact-match replays almost never occur on agentic traffic; Anthropic prompt caching is preserved instead.</span>
       </div>
-      <span class="chip" id="b-l1-chip">L1 -</span>
-      <div class="tog" id="t-l1_cache"><div class="thumb"></div></div>
+      <span class="chip off" id="b-l1-chip">L1 off</span>
+      <div class="tog disabled" id="t-l1_cache" title="Disabled for this proxy"><div class="thumb"></div></div>
     </div>
     <div class="cctl" data-tip-pos="top" data-tip="When ON, proxy auto-inserts a cache_control&#10;breakpoint at the system/tools boundary if the&#10;client didn't set one. Protects the prefix from&#10;compression-induced cache invalidation.">
       <div class="cctl-text">
@@ -364,10 +365,10 @@ code{font-family:var(--mono);font-size:.9em;padding:1px 6px;border-radius:4px;ba
         <div class="cctl" data-tip-pos="top" data-tip="Phase 2b. Semantic response cache. Embeds the&#10;request, ANN-looks-up in a vector store (Qdrant&#10;or in-memory). Disabled when no embedder/store&#10;is configured.">
           <div class="cctl-text">
             <span class="cctl-label">L2 semantic cache</span>
-            <span class="cctl-sub">Embeds the request, ANN lookup, replays near-matches above the similarity threshold.</span>
+            <span class="cctl-sub">Disabled — needs an external (OpenAI) embedder and risks near-match false hits on coding traffic. Not used by this proxy.</span>
           </div>
-          <span class="chip" id="b-l2-chip">L2 -</span>
-          <div class="tog" id="t-l2_cache"><div class="thumb"></div></div>
+          <span class="chip off" id="b-l2-chip">L2 off</span>
+          <div class="tog disabled" id="t-l2_cache" title="Disabled for this proxy"><div class="thumb"></div></div>
         </div>
         <div class="cctl" data-tip-pos="top" data-tip="LLMLingua-2 in-process compression of volatile&#10;tail blocks (right of cache wall). Lossy but&#10;structure-preserving. Requires `pip install -e .[lingua]`&#10;(~200MB BERT model).">
           <div class="cctl-text">
@@ -720,8 +721,6 @@ async function refreshSettings(){
     setTog('lsh',!!lsh.enabled);
     setTog('adaptive',!!d.adaptive);
     setTog('lingua',!!lng.enabled);
-    setTog('l1_cache',!!d.l1_cache);
-    setTog('l2_cache',!!d.l2_cache);
     setTog('auto_insert_wall',!!d.auto_insert_wall);
     setTog('rate_limit',!!d.rate_limit);
     setEngState('eng-cv',!!cv.enabled);
@@ -788,8 +787,6 @@ bindToggle('json_aware','json_aware');
 bindToggle('lsh','lsh');
 bindToggle('adaptive');
 bindToggle('lingua','lingua');
-bindToggle('l1_cache');
-bindToggle('l2_cache');
 bindToggle('auto_insert_wall');
 bindToggle('rate_limit');
 bindLevels('caveman','caveman');
@@ -1036,8 +1033,6 @@ document.addEventListener('keydown',ev=>{
   else if(k==='s')click('t-json_aware');
   else if(k==='l')click('t-lsh');
   else if(k==='a')click('t-adaptive');
-  else if(k==='1')click('t-l1_cache');
-  else if(k==='2')click('t-l2_cache');
   else if(k==='w')click('t-auto_insert_wall');
   else if(k==='g')click('t-lingua');
   else if(k==='t')click('t-rate_limit');

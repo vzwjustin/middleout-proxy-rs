@@ -30,9 +30,14 @@ struct OpenAIResponsesAccumulator {
     model: Option<String>,
     saw_usage: bool,
     parse_sse: bool,
-    /// Raw text of the most recent `data:` SSE event seen, truncated. Used to
+    /// Raw text of the most recent `data:` SSE event seen (untruncated). Used to
     /// surface the upstream event shape when usage extraction fails on a 2xx.
     last_sse_event: Option<String>,
+    /// [CODEX-USAGE-DIAG] every SSE event `type` seen, and the full text of any
+    /// event that carries a `usage` field anywhere. REMOVE once the codex usage
+    /// wire-shape is known and `extract_usage_from_openai_response` handles it.
+    seen_types: std::collections::BTreeSet<String>,
+    usage_events: Vec<String>,
 }
 
 impl OpenAIResponsesAccumulator {
@@ -45,6 +50,8 @@ impl OpenAIResponsesAccumulator {
             saw_usage: false,
             parse_sse,
             last_sse_event: None,
+            seen_types: std::collections::BTreeSet::new(),
+            usage_events: Vec::new(),
         }
     }
 
@@ -106,8 +113,15 @@ impl OpenAIResponsesAccumulator {
                 Err(_) => continue,
             };
             // Capture the latest event so a 2xx-with-no-usage can report the shape.
-            self.last_sse_event = Some(decoded.chars().take(800).collect());
+            self.last_sse_event = Some(decoded.to_string());
             if let Ok(payload) = serde_json::from_str::<serde_json::Value>(decoded) {
+                // [CODEX-USAGE-DIAG] record event vocabulary and any usage-bearing event.
+                if let Some(t) = payload.get("type").and_then(|v| v.as_str()) {
+                    self.seen_types.insert(t.to_string());
+                }
+                if json_contains_key(&payload, "usage") && self.usage_events.len() < 4 {
+                    self.usage_events.push(decoded.to_string());
+                }
                 if let Some(response) = payload.get("response") {
                     self.consume_response(response);
                 } else {
@@ -194,11 +208,19 @@ impl<S> ResponsesLoggingStream<S> {
         // mismatch can be fixed rather than failing invisibly.
         if !self.acc.saw_usage() && (200..300).contains(&self.status_code) {
             eprintln!(
-                "[middleout] /v1/responses {} streamed but no usage parsed (parse_sse={}, bytes_out={}); last event: {}",
+                "[middleout] /v1/responses {} streamed but no usage parsed (parse_sse={}, bytes_out={}); types={:?}; see codex-usage-debug.json",
                 self.status_code,
                 self.acc.parse_sse,
                 self.bytes_out,
-                self.acc.last_sse_event.as_deref().unwrap_or("<none>")
+                self.acc.seen_types
+            );
+            dump_codex_usage_debug(
+                &self.state.settings.audit_log_dir,
+                self.status_code,
+                self.acc.parse_sse,
+                &self.acc.seen_types,
+                &self.acc.usage_events,
+                self.acc.last_sse_event.as_deref(),
             );
         }
 
@@ -275,6 +297,41 @@ fn forwarded_headers(headers: &HeaderMap) -> HashMap<String, String> {
         }
     }
     out
+}
+
+/// [CODEX-USAGE-DIAG] recursively report whether a JSON value contains `key` anywhere.
+fn json_contains_key(v: &serde_json::Value, key: &str) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.contains_key(key) || map.values().any(|x| json_contains_key(x, key))
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(|x| json_contains_key(x, key)),
+        _ => false,
+    }
+}
+
+/// [CODEX-USAGE-DIAG] dump captured codex SSE diagnostics to `<dir>/codex-usage-debug.json`
+/// for offline inspection. REMOVE with the rest of the CODEX-USAGE-DIAG scaffolding.
+fn dump_codex_usage_debug(
+    dir: &std::path::Path,
+    status: u16,
+    parse_sse: bool,
+    types: &std::collections::BTreeSet<String>,
+    usage_events: &[String],
+    last_event: Option<&str>,
+) {
+    let payload = serde_json::json!({
+        "status": status,
+        "parse_sse": parse_sse,
+        "seen_types": types,
+        "usage_events": usage_events,
+        "last_event": last_event,
+    });
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(
+        dir.join("codex-usage-debug.json"),
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    );
 }
 
 fn openai_cache_key_context(headers: &HashMap<String, String>) -> serde_json::Value {
@@ -703,6 +760,36 @@ pub async fn responses_handler(
                         response_headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
                     }
                 }
+            }
+        } else {
+            // The body did not parse as JSON. Some upstreams (notably the ChatGPT
+            // Codex backend) stream Server-Sent Events without a
+            // `text/event-stream` content-type, so `parse_sse` was false above and
+            // the whole event stream was buffered here. Recover model/usage by
+            // parsing it as SSE so cost and token stats are not silently lost.
+            let mut acc = OpenAIResponsesAccumulator::new(true);
+            acc.feed(&res_bytes);
+            acc.feed(b"\n"); // flush a final event lacking a trailing newline
+            if let Some(model) = acc.model() {
+                final_model = Some(model.to_string());
+            }
+            if acc.saw_usage() {
+                record_openai_cost(&state, final_model.as_deref(), acc.usage(), bytes_in);
+            } else {
+                eprintln!(
+                    "[middleout] /v1/responses {} returned a non-JSON body with no parseable usage (parse_sse={}); types={:?}; see codex-usage-debug.json",
+                    status.as_u16(),
+                    parse_sse,
+                    acc.seen_types
+                );
+                dump_codex_usage_debug(
+                    &state.settings.audit_log_dir,
+                    status.as_u16(),
+                    parse_sse,
+                    &acc.seen_types,
+                    &acc.usage_events,
+                    acc.last_sse_event.as_deref(),
+                );
             }
         }
     }

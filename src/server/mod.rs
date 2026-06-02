@@ -1176,6 +1176,35 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    /// Serves an SSE event-stream body but labels it `application/json`, mimicking
+    /// upstreams (e.g. the ChatGPT Codex backend) that stream without a
+    /// `text/event-stream` content-type.
+    async fn spawn_openai_responses_sse_mislabeled_upstream(
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let body = Arc::new(body);
+        let app = Router::new().route(
+            "/responses",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+                        (*body).clone(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OpenAI responses mislabeled SSE test upstream");
+        let addr = listener.local_addr().expect("test upstream address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), handle)
+    }
+
     async fn spawn_openai_responses_sse_upstream(
         body: String,
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -1565,6 +1594,62 @@ mod tests {
         assert_eq!(model_row.get("input_tokens").and_then(|v| v.as_i64()), Some(13));
         assert_eq!(model_row.get("output_tokens").and_then(|v| v.as_i64()), Some(5));
         assert_eq!(model_row.get("cache_read_tokens").and_then(|v| v.as_i64()), Some(4));
+    }
+
+    #[tokio::test]
+    async fn responses_api_records_usage_when_sse_body_mislabeled_as_json() {
+        // Regression: an upstream that streams SSE without a `text/event-stream`
+        // content-type lands in the buffered (non-streaming) branch, where the
+        // body fails JSON parsing. Usage must still be recovered by parsing it as
+        // SSE, otherwise codex cost/token stats are silently dropped.
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_mislabeled",
+                "status": "completed",
+                "model": "gpt-5.5",
+                "usage": {
+                    "input_tokens": 21,
+                    "output_tokens": 9,
+                    "input_tokens_details": { "cached_tokens": 5 }
+                }
+            }
+        });
+        let sse_body = format!("event: response.completed\ndata: {}\n\n", completed);
+        let (upstream, handle) = spawn_openai_responses_sse_mislabeled_upstream(sse_body).await;
+        let settings = Settings {
+            openai_upstream_url: upstream,
+            ..Default::default()
+        };
+        let state = test_state(
+            "http://127.0.0.1:9".to_string(),
+            settings,
+            crate::server::policies::PolicyRouter::new(Vec::new(), None),
+        );
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"model": "gpt-5.5", "input": "hi"}).to_string()))
+                    .expect("build responses request"),
+            )
+            .await
+            .expect("responses proxy response");
+        handle.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cost = state.cost_tracker.snapshot();
+        let model_row = cost
+            .get("by_model")
+            .and_then(|v| v.get("openai:gpt-5.5"))
+            .expect("usage should be recovered from a mislabeled SSE body");
+        assert_eq!(model_row.get("input_tokens").and_then(|v| v.as_i64()), Some(21));
+        assert_eq!(model_row.get("output_tokens").and_then(|v| v.as_i64()), Some(9));
+        assert_eq!(model_row.get("cache_read_tokens").and_then(|v| v.as_i64()), Some(5));
     }
 
     #[tokio::test]
