@@ -1,0 +1,42 @@
+[package]
+name = "middleout-proxy-rs"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+# Async Runtime & Web Server
+tokio = { version = "1.38", features = ["full"] }
+axum = { version = "0.7.5", features = ["macros"] }
+tower = { version = "0.4.13", features = ["util"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+
+# HTTP Client
+reqwest = { version = "0.12.4", features = ["json", "stream"] }
+
+# Serialization & Config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8.14"
+
+# Database & Caching
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+parking_lot = "0.12.3"
+
+# Streaming & Utilities
+bytes = "1.6.0"
+futures = "0.3.30"
+futures-util = "0.3.30"
+headers = "0.4.0"
+mime = "0.3.17"
+
+# Hashing, Cryptography & Math
+blake2 = "0.10.6"
+sha2 = "0.10.8"
+rand = "0.8.5"
+regex = "1.10.5"
+
+# Observability
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+prometheus = { version = "0.13.4", features = ["process"] }
+chrono = "0.4.38"
