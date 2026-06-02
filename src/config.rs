@@ -27,6 +27,7 @@ pub struct Settings {
 
     // Upstream
     pub upstream_base_url: String,
+    pub openai_upstream_url: String,
     pub auth_mode: String,
 
     // Input Compaction
@@ -119,6 +120,7 @@ impl Default for Settings {
             port: 8787,
             reload: false,
             upstream_base_url: "https://api.anthropic.com".to_string(),
+            openai_upstream_url: "https://chatgpt.com/backend-api/codex".to_string(),
             auth_mode: "subscription_oauth_passthrough_only".to_string(),
             input_compression_enabled: true,
             max_text_chars: 12000,
@@ -126,8 +128,8 @@ impl Default for Settings {
             head_fraction: 0.55,
             compress_system: false,
             compress_tool_results: true,
-            jl_dedupe_enabled: true,
-            jl_dims: 512,
+            jl_dedupe_enabled: false,
+            jl_dims: 128,
             jl_shingle_tokens: 5,
             jl_similarity_threshold: 0.985,
             jl_min_chars: 4000,
@@ -198,6 +200,7 @@ struct RawServerSection {
     port: Option<u16>,
     reload: Option<bool>,
     upstream_base_url: Option<String>,
+    openai_upstream_url: Option<String>,
     connect_timeout_s: Option<f64>,
     read_timeout_s: Option<f64>,
     anthropic_version: Option<String>,
@@ -321,6 +324,7 @@ fn flatten_toml_config(raw: RawTomlConfig, out: &mut HashMap<String, String>) {
         if let Some(v) = sec.port { out.insert("port".to_string(), v.to_string()); }
         if let Some(v) = sec.reload { out.insert("reload".to_string(), v.to_string()); }
         if let Some(v) = sec.upstream_base_url { out.insert("upstream_base_url".to_string(), v); }
+        if let Some(v) = sec.openai_upstream_url { out.insert("openai_upstream_url".to_string(), v); }
         if let Some(v) = sec.connect_timeout_s { out.insert("timeout_connect_s".to_string(), v.to_string()); }
         if let Some(v) = sec.read_timeout_s { out.insert("timeout_read_s".to_string(), v.to_string()); }
         if let Some(v) = sec.anthropic_version { out.insert("default_anthropic_version".to_string(), v); }
@@ -447,6 +451,7 @@ pub fn load_settings() -> Result<Settings, String> {
     let port = get_env_or_toml_or_default("MIDDLEOUT_PORT", "port", &toml_map, def.port, parse_u16);
     let reload = get_env_or_toml_or_default("MIDDLEOUT_RELOAD", "reload", &toml_map, def.reload, parse_bool);
     let upstream_base_url = get_env_or_toml_or_default("PROXY_UPSTREAM_BASE_URL", "upstream_base_url", &toml_map, def.upstream_base_url, parse_str);
+    let openai_upstream_url = get_env_or_toml_or_default("MIDDLEOUT_OPENAI_UPSTREAM_URL", "openai_upstream_url", &toml_map, def.openai_upstream_url, parse_str);
     let input_compression_enabled = get_env_or_toml_or_default("MIDDLEOUT_INPUT_COMPRESSION", "input_compression_enabled", &toml_map, def.input_compression_enabled, parse_bool);
     let max_text_chars = get_env_or_toml_or_default("MIDDLEOUT_MAX_TEXT_CHARS", "max_text_chars", &toml_map, def.max_text_chars, parse_usize);
     let min_omission_chars = get_env_or_toml_or_default("MIDDLEOUT_MIN_OMISSION_CHARS", "min_omission_chars", &toml_map, def.min_omission_chars, parse_usize);
@@ -551,6 +556,7 @@ pub fn load_settings() -> Result<Settings, String> {
         port,
         reload,
         upstream_base_url,
+        openai_upstream_url,
         auth_mode: def.auth_mode,
         input_compression_enabled,
         max_text_chars,

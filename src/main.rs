@@ -9,6 +9,15 @@ pub mod server;
 
 use std::sync::Arc;
 
+fn qdrant_api_key(settings: &crate::config::Settings) -> Option<String> {
+    if !settings.l2_qdrant_api_key.trim().is_empty() {
+        return Some(settings.l2_qdrant_api_key.clone());
+    }
+    std::env::var("QDRANT_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing subscriber
@@ -69,7 +78,7 @@ async fn main() {
     let vector_store: Option<Arc<dyn crate::cache::l2::VectorStore>> = if settings.l2_cache_enabled {
         match settings.l2_backend.as_str() {
             "qdrant" => {
-                let api_key = std::env::var("QDRANT_API_KEY").ok();
+                let api_key = qdrant_api_key(&settings);
                 Some(Arc::new(crate::cache::l2::QdrantVectorStore::new(
                     settings.l2_qdrant_url.clone(),
                     settings.l2_qdrant_collection.clone(),
@@ -140,5 +149,22 @@ async fn main() {
     println!("MiddleOut Claude Proxy running on http://{}", addr);
     if let Err(err) = axum::serve(listener, router).await {
         eprintln!("Fatal server execution error: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn qdrant_api_key_prefers_configured_setting() {
+        let settings = crate::config::Settings {
+            l2_qdrant_api_key: "from-settings".to_string(),
+            ..Default::default()
+        };
+        std::env::remove_var("QDRANT_API_KEY");
+
+        assert_eq!(
+            super::qdrant_api_key(&settings).as_deref(),
+            Some("from-settings")
+        );
     }
 }
