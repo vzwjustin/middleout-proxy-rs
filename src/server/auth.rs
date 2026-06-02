@@ -124,6 +124,30 @@ pub fn cache_key_context(
     Value::Object(ctx)
 }
 
+pub fn rate_limit_key(
+    request_headers: &HashMap<String, String>,
+    auth_header: &str,
+) -> String {
+    let auth_trimmed = auth_header.trim();
+    if !auth_trimmed.is_empty() {
+        let mut hasher = Sha256::new();
+        hasher.update(auth_trimmed.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        return format!("auth:{}", &digest[..16]);
+    }
+
+    if let Some(forwarded_for) = request_headers.get("x-forwarded-for") {
+        if let Some(first) = forwarded_for.split(',').next() {
+            let first = first.trim();
+            if !first.is_empty() {
+                return format!("ip:{}", first);
+            }
+        }
+    }
+
+    "anonymous".to_string()
+}
+
 pub fn forward_response_headers(headers: &HeaderMap) -> HashMap<String, String> {
     let mut forwarded = HashMap::new();
     for (name, value) in headers.iter() {

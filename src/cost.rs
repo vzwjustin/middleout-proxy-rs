@@ -144,6 +144,46 @@ pub fn extract_usage_from_anthropic(payload: &Value) -> HashMap<String, i64> {
     out
 }
 
+pub fn extract_usage_from_openai_response(payload: &Value) -> HashMap<String, i64> {
+    let mut out = HashMap::new();
+    out.insert("input_tokens".to_string(), 0);
+    out.insert("output_tokens".to_string(), 0);
+    out.insert("cache_write_tokens".to_string(), 0);
+    out.insert("cache_read_tokens".to_string(), 0);
+
+    let usage = payload
+        .get("usage")
+        .or_else(|| payload.get("response").and_then(|r| r.get("usage")));
+    let usage = match usage {
+        Some(u) => u,
+        None => return out,
+    };
+
+    let parse_int = |key: &str| -> i64 {
+        usage.get(key)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0)
+    };
+    let nested_int = |object_key: &str, value_key: &str| -> i64 {
+        usage
+            .get(object_key)
+            .and_then(|v| v.get(value_key))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0)
+    };
+
+    out.insert("input_tokens".to_string(), parse_int("input_tokens").max(parse_int("prompt_tokens")));
+    out.insert("output_tokens".to_string(), parse_int("output_tokens").max(parse_int("completion_tokens")));
+    out.insert(
+        "cache_read_tokens".to_string(),
+        nested_int("input_tokens_details", "cached_tokens")
+            .max(nested_int("prompt_tokens_details", "cached_tokens")),
+    );
+    out
+}
+
 pub struct SSEUsageAccumulator {
     buf: Vec<u8>,
     usage: HashMap<String, i64>,
@@ -325,11 +365,31 @@ impl CostTracker {
 
     pub fn snapshot(&self) -> Value {
         let inner = self.inner.lock();
+        let mut by_provider: HashMap<String, ModelCostSummary> = HashMap::new();
+        for (key, row) in &inner.by_model {
+            let provider = key.split_once(':').map(|(provider, _)| provider).unwrap_or("unknown");
+            let summary = by_provider.entry(provider.to_string()).or_insert(ModelCostSummary {
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                usd: 0.0,
+            });
+            summary.requests += row.requests;
+            summary.input_tokens += row.input_tokens;
+            summary.output_tokens += row.output_tokens;
+            summary.cache_write_tokens += row.cache_write_tokens;
+            summary.cache_read_tokens += row.cache_read_tokens;
+            summary.usd += row.usd;
+        }
+
         serde_json::json!({
             "total_usd": (inner.total_usd * 1_000_000.0).round() / 1_000_000.0,
             "total_requests": inner.total_requests,
             "unmatched_requests": inner.unmatched_requests,
             "by_model": inner.by_model,
+            "by_provider": by_provider,
         })
     }
 
@@ -405,4 +465,3 @@ impl UsageBudget {
         false
     }
 }
-

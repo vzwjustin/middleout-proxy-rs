@@ -108,8 +108,52 @@ struct Bucket {
     bytes_in: usize,
     bytes_out: usize,
     engines: HashMap<String, usize>,
+    by_provider: HashMap<String, ProviderTrafficSummary>,
     latency_counts: Vec<usize>,
     latency_total: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ProviderTrafficSummary {
+    requests: usize,
+    compressed_requests: usize,
+    errors: usize,
+    chars_saved_in: usize,
+    chars_saved_out: usize,
+    bytes_in: usize,
+    bytes_out: usize,
+    engines: HashMap<String, usize>,
+}
+
+impl ProviderTrafficSummary {
+    fn observe(
+        &mut self,
+        is_error: bool,
+        chars_saved_in: usize,
+        chars_saved_out: usize,
+        bytes_in: usize,
+        bytes_out: usize,
+        engines: &HashMap<String, usize>,
+    ) {
+        self.requests += 1;
+        if chars_saved_in > 0 || chars_saved_out > 0 {
+            self.compressed_requests += 1;
+        }
+        if is_error {
+            self.errors += 1;
+        }
+        self.chars_saved_in += chars_saved_in;
+        self.chars_saved_out += chars_saved_out;
+        self.bytes_in += bytes_in;
+        self.bytes_out += bytes_out;
+
+        for (engine, &saved) in engines {
+            if saved == 0 {
+                continue;
+            }
+            *self.engines.entry(engine.clone()).or_insert(0) += saved;
+        }
+    }
 }
 
 impl Bucket {
@@ -123,6 +167,7 @@ impl Bucket {
             bytes_in: 0,
             bytes_out: 0,
             engines: HashMap::new(),
+            by_provider: HashMap::new(),
             latency_counts: vec![0; LATENCY_BINS_MS.len() + 1],
             latency_total: 0,
         }
@@ -138,10 +183,48 @@ impl Bucket {
             "bytes_in": self.bytes_in,
             "bytes_out": self.bytes_out,
             "engines": self.engines,
+            "by_provider": self.by_provider,
             "p50_ms": (quantile_from_hist(&self.latency_counts, self.latency_total, 0.50) * 100.0).round() / 100.0,
             "p95_ms": (quantile_from_hist(&self.latency_counts, self.latency_total, 0.95) * 100.0).round() / 100.0,
         })
     }
+}
+
+pub fn provider_for_request(path: &str, model: Option<&str>) -> &'static str {
+    let normalized = path.trim().trim_start_matches('/').trim_end_matches('/');
+    if normalized == "v1/messages" || normalized.starts_with("v1/messages/") {
+        return "anthropic";
+    }
+    if normalized == "v1/responses"
+        || normalized.starts_with("v1/responses/")
+        || normalized == "v1/models"
+        || normalized.starts_with("v1/models/")
+        || normalized == "v1/chat/completions"
+        || normalized.starts_with("v1/chat/completions/")
+        || normalized == "v1/completions"
+        || normalized.starts_with("v1/completions/")
+        || normalized == "v1/embeddings"
+        || normalized.starts_with("v1/embeddings/")
+    {
+        return "openai";
+    }
+
+    let Some(model) = model else {
+        return "unknown";
+    };
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("claude-") {
+        return "anthropic";
+    }
+    if model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("codex-")
+    {
+        return "openai";
+    }
+    "unknown"
 }
 
 pub struct ProxyStats {
@@ -157,6 +240,7 @@ pub struct ProxyStats {
     pub bytes_in_total: usize,
     pub bytes_out_total: usize,
     pub engines_total: HashMap<String, usize>,
+    pub by_provider: HashMap<String, ProviderTrafficSummary>,
     window_minutes: usize,
     recent_max: usize,
     buckets: HashMap<i64, Bucket>,
@@ -184,6 +268,7 @@ impl ProxyStats {
             bytes_in_total: 0,
             bytes_out_total: 0,
             engines_total: HashMap::new(),
+            by_provider: HashMap::new(),
             window_minutes,
             recent_max,
             buckets: HashMap::new(),
@@ -211,6 +296,7 @@ impl ProxyStats {
             "bytes_in_total": self.bytes_in_total,
             "bytes_out_total": self.bytes_out_total,
             "engines_total": self.engines_total,
+            "by_provider": self.by_provider,
             "uptime_s": (now - self.started_at).round(),
             "p50_ms": (quantile_from_hist(&self.latency_global_counts, self.latency_global_total, 0.50) * 100.0).round() / 100.0,
             "p95_ms": (quantile_from_hist(&self.latency_global_counts, self.latency_global_total, 0.95) * 100.0).round() / 100.0,
@@ -285,6 +371,12 @@ impl ProxyStats {
             *self.engines_total.entry(engine.clone()).or_insert(0) += saved;
         }
 
+        let provider = provider_for_request(path, model);
+        self.by_provider
+            .entry(provider.to_string())
+            .or_default()
+            .observe(is_error, chars_saved_in, chars_saved_out, bytes_in, bytes_out, engines);
+
         let idx = bin_index(latency_ms.max(0.0));
         self.latency_global_counts[idx] += 1;
         self.latency_global_total += 1;
@@ -305,6 +397,11 @@ impl ProxyStats {
             }
             *bucket.engines.entry(engine.clone()).or_insert(0) += saved;
         }
+        bucket
+            .by_provider
+            .entry(provider.to_string())
+            .or_default()
+            .observe(is_error, chars_saved_in, chars_saved_out, bytes_in, bytes_out, engines);
         bucket.latency_counts[idx] += 1;
         bucket.latency_total += 1;
 
@@ -319,6 +416,7 @@ impl ProxyStats {
             "bytes_in": bytes_in,
             "bytes_out": bytes_out,
             "engines": engines,
+            "provider": provider,
             "request_id": request_id,
             "is_error": is_error,
             "model": model,

@@ -19,6 +19,51 @@ pub struct CompressionEvent {
     pub sample_after: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn auto_insert_cache_wall_adds_cache_control_to_static_prefix() {
+        let settings = crate::config::Settings {
+            auto_insert_cache_wall: true,
+            preserve_anthropic_cache: true,
+            input_compression_enabled: true,
+            ..Default::default()
+        };
+
+        let compressor = PayloadCompressor::new(settings);
+        let payload = json!({
+            "system": "stable reusable system prompt",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hello"}
+                    ]
+                }
+            ]
+        });
+
+        let (compressed, _) = compressor
+            .compress_request_payload(&payload, "/v1/messages", None, true)
+            .expect("compression should succeed");
+
+        let system = compressed
+            .get("system")
+            .and_then(|value| value.as_array())
+            .expect("string system prompt should be converted to block array");
+        assert!(
+            system
+                .first()
+                .and_then(|block| block.get("cache_control"))
+                .is_some(),
+            "auto-inserted cache wall should add cache_control to the reusable prefix"
+        );
+    }
+}
+
 impl CompressionEvent {
     pub fn chars_saved(&self) -> usize {
         if self.original_chars > self.compressed_chars {
@@ -222,9 +267,10 @@ pub struct CompressRequestOptions {
     pub json_aware: Option<serde_json::Value>,
     pub lsh: Option<serde_json::Value>,
     pub max_text_chars: Option<usize>,
+    pub auto_insert_cache_wall: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PayloadCompressor {
     pub settings: crate::config::Settings,
     pub result_cache: std::sync::Arc<CompressionResultCache>,
@@ -262,10 +308,14 @@ impl PayloadCompressor {
             json_aware: None,
             lsh: None,
             max_text_chars: None,
+            auto_insert_cache_wall: None,
         });
 
         let jl_active = opts.jl_dedupe.unwrap_or(self.settings.jl_dedupe_enabled);
         let max_text_chars_active = opts.max_text_chars.unwrap_or(self.settings.max_text_chars);
+        let auto_insert_cache_wall = opts
+            .auto_insert_cache_wall
+            .unwrap_or(self.settings.auto_insert_cache_wall);
 
         let caveman_enabled = opts.caveman.as_ref()
             .and_then(|v| v.get("enabled").and_then(|b| b.as_bool()))
@@ -302,7 +352,10 @@ impl PayloadCompressor {
         );
 
         let wall = if self.settings.preserve_anthropic_cache {
-            Some(crate::compression::cache_wall::compute_wall(&mut working, false))
+            Some(crate::compression::cache_wall::compute_wall(
+                &mut working,
+                auto_insert_cache_wall,
+            ))
         } else {
             None
         };
@@ -326,7 +379,7 @@ impl PayloadCompressor {
                         false,
                         crate::compression::cache_wall::BlockKind::System,
                         None,
-                        jl_active,
+                        false, // JL/LSH never useful on static system prompt
                         max_text_chars_active,
                         caveman_enabled,
                         &caveman_level,
@@ -334,7 +387,7 @@ impl PayloadCompressor {
                         &rtk_level,
                         json_aware_enabled,
                         &json_aware_level,
-                        lsh_enabled,
+                        false,
                         &lsh_level,
                         wall.as_ref(),
                     )?;
@@ -363,6 +416,9 @@ impl PayloadCompressor {
                     }
                 }
 
+                // Only run JL/LSH on conversational turns — tool results are structured
+                // and change every request, so dedup never fires and only burns CPU.
+                let is_conversational = role == "user" || role == "assistant";
                 *content_value = self.compress_content_value(
                     content_value,
                     &format!("messages[{}].{}.content", i, role),
@@ -371,7 +427,7 @@ impl PayloadCompressor {
                     self.settings.compress_tool_results,
                     crate::compression::cache_wall::BlockKind::Message,
                     Some(i),
-                    jl_active,
+                    jl_active && is_conversational,
                     max_text_chars_active,
                     caveman_enabled,
                     &caveman_level,
@@ -379,7 +435,7 @@ impl PayloadCompressor {
                     &rtk_level,
                     json_aware_enabled,
                     &json_aware_level,
-                    lsh_enabled,
+                    lsh_enabled && is_conversational,
                     &lsh_level,
                     wall.as_ref(),
                 )?;
@@ -387,6 +443,197 @@ impl PayloadCompressor {
         }
 
         Ok((working, audit))
+    }
+
+    pub fn compress_openai_responses_request_payload(
+        &self,
+        payload: &serde_json::Value,
+        endpoint: &str,
+        opts: Option<CompressRequestOptions>,
+        force_enabled: bool,
+    ) -> Result<(serde_json::Value, CompressionAudit), String> {
+        let mut audit = CompressionAudit::new(endpoint);
+        if !force_enabled && !self.settings.input_compression_enabled {
+            return Ok((payload.clone(), audit));
+        }
+
+        let opts = opts.unwrap_or(CompressRequestOptions {
+            jl_dedupe: None,
+            caveman: None,
+            rtk: None,
+            json_aware: None,
+            lsh: None,
+            max_text_chars: None,
+            auto_insert_cache_wall: None,
+        });
+
+        let jl_active = opts.jl_dedupe.unwrap_or(self.settings.jl_dedupe_enabled);
+        let max_text_chars_active = opts.max_text_chars.unwrap_or(self.settings.max_text_chars);
+        let caveman_enabled = opts.caveman.as_ref()
+            .and_then(|v| v.get("enabled").and_then(|b| b.as_bool()))
+            .unwrap_or(self.settings.caveman_enabled);
+        let caveman_level = opts.caveman.as_ref()
+            .and_then(|v| v.get("level").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| self.settings.caveman_level.clone());
+        let rtk_enabled = opts.rtk.as_ref()
+            .and_then(|v| v.get("enabled").and_then(|b| b.as_bool()))
+            .unwrap_or(self.settings.rtk_enabled);
+        let rtk_level = opts.rtk.as_ref()
+            .and_then(|v| v.get("level").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| self.settings.rtk_level.clone());
+        let json_aware_enabled = opts.json_aware.as_ref()
+            .and_then(|v| v.get("enabled").and_then(|b| b.as_bool()))
+            .unwrap_or(self.settings.json_aware_enabled);
+        let json_aware_level = opts.json_aware.as_ref()
+            .and_then(|v| v.get("level").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| self.settings.json_aware_level.clone());
+
+        let mut working = payload.clone();
+        let mut sketch_index = crate::compression::jl::RequestSketchIndex::new(
+            self.settings.jl_dims,
+            self.settings.jl_shingle_tokens,
+        );
+
+        if let Some(instructions) = working.get_mut("instructions") {
+            *instructions = self.compress_openai_input_value(
+                instructions,
+                "instructions",
+                &mut audit,
+                &mut sketch_index,
+                false,
+                max_text_chars_active,
+                caveman_enabled,
+                &caveman_level,
+                rtk_enabled,
+                &rtk_level,
+                json_aware_enabled,
+                &json_aware_level,
+            )?;
+        }
+
+        if let Some(input) = working.get_mut("input") {
+            *input = self.compress_openai_input_value(
+                input,
+                "input",
+                &mut audit,
+                &mut sketch_index,
+                jl_active,
+                max_text_chars_active,
+                caveman_enabled,
+                &caveman_level,
+                rtk_enabled,
+                &rtk_level,
+                json_aware_enabled,
+                &json_aware_level,
+            )?;
+        }
+
+        Ok((working, audit))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compress_openai_input_value(
+        &self,
+        value: &serde_json::Value,
+        path: &str,
+        audit: &mut CompressionAudit,
+        sketch_index: &mut crate::compression::jl::RequestSketchIndex,
+        jl_active: bool,
+        max_text_chars_active: usize,
+        caveman_enabled: bool,
+        caveman_level: &str,
+        rtk_enabled: bool,
+        rtk_level: &str,
+        json_aware_enabled: bool,
+        json_aware_level: &str,
+    ) -> Result<serde_json::Value, String> {
+        if let Some(text) = value.as_str() {
+            let compressed = self.compress_text_with_dedupe(
+                text,
+                path,
+                audit,
+                sketch_index,
+                jl_active,
+                max_text_chars_active,
+                caveman_enabled,
+                caveman_level,
+                rtk_enabled,
+                rtk_level,
+                json_aware_enabled,
+                json_aware_level,
+            )?;
+            return Ok(serde_json::Value::String(compressed));
+        }
+
+        if let Some(arr) = value.as_array() {
+            let mut out = arr.clone();
+            for (i, item) in out.iter_mut().enumerate() {
+                *item = self.compress_openai_input_value(
+                    item,
+                    &format!("{}[{}]", path, i),
+                    audit,
+                    sketch_index,
+                    jl_active,
+                    max_text_chars_active,
+                    caveman_enabled,
+                    caveman_level,
+                    rtk_enabled,
+                    rtk_level,
+                    json_aware_enabled,
+                    json_aware_level,
+                )?;
+            }
+            return Ok(serde_json::Value::Array(out));
+        }
+
+        let Some(obj) = value.as_object() else {
+            return Ok(value.clone());
+        };
+        let mut out = obj.clone();
+
+        let text_type = out.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let is_text_item = text_type.is_empty() || matches!(text_type, "input_text" | "text");
+        if is_text_item {
+            if let Some(text) = out.get("text").and_then(|v| v.as_str()) {
+                let compressed = self.compress_text_with_dedupe(
+                    text,
+                    &format!("{}.text", path),
+                    audit,
+                    sketch_index,
+                    jl_active,
+                    max_text_chars_active,
+                    caveman_enabled,
+                    caveman_level,
+                    rtk_enabled,
+                    rtk_level,
+                    json_aware_enabled,
+                    json_aware_level,
+                )?;
+                out.insert("text".to_string(), serde_json::Value::String(compressed));
+            }
+        }
+
+        if let Some(content) = out.get("content").cloned() {
+            out.insert(
+                "content".to_string(),
+                self.compress_openai_input_value(
+                    &content,
+                    &format!("{}.content", path),
+                    audit,
+                    sketch_index,
+                    jl_active,
+                    max_text_chars_active,
+                    caveman_enabled,
+                    caveman_level,
+                    rtk_enabled,
+                    rtk_level,
+                    json_aware_enabled,
+                    json_aware_level,
+                )?,
+            );
+        }
+
+        Ok(serde_json::Value::Object(out))
     }
 
     fn compress_content_value(
@@ -801,6 +1048,78 @@ impl PayloadCompressor {
             }
         }
         (working, audit)
+    }
+
+    pub fn compress_openai_responses_response_payload(
+        &self,
+        payload: &serde_json::Value,
+        endpoint: &str,
+        force_enabled: bool,
+    ) -> (serde_json::Value, CompressionAudit) {
+        let mut audit = CompressionAudit::new(endpoint);
+        if !force_enabled && !self.settings.output_compression_enabled {
+            return (payload.clone(), audit);
+        }
+
+        let working = self.compress_openai_output_value(payload, "response", &mut audit);
+        (working, audit)
+    }
+
+    fn compress_openai_output_value(
+        &self,
+        value: &serde_json::Value,
+        path: &str,
+        audit: &mut CompressionAudit,
+    ) -> serde_json::Value {
+        if let Some(arr) = value.as_array() {
+            return serde_json::Value::Array(
+                arr.iter()
+                    .enumerate()
+                    .map(|(i, item)| self.compress_openai_output_value(item, &format!("{}[{}]", path, i), audit))
+                    .collect(),
+            );
+        }
+
+        let Some(obj) = value.as_object() else {
+            return value.clone();
+        };
+        let mut out = obj.clone();
+
+        let text_type = out.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let is_text_item = matches!(text_type, "output_text" | "text");
+        if is_text_item {
+            if let Some(text) = out.get("text").and_then(|v| v.as_str()) {
+                let compressed = middle_out_text(
+                    text,
+                    self.settings.output_max_text_chars,
+                    self.settings.min_omission_chars,
+                    self.settings.head_fraction,
+                );
+                if compressed != text {
+                    let digest = sha256_short(text);
+                    audit.events.push(self.make_event(
+                        &format!("{}.text", path),
+                        "middle-out-response",
+                        text,
+                        &compressed,
+                        &digest,
+                        "",
+                    ));
+                    out.insert("text".to_string(), serde_json::Value::String(compressed));
+                }
+            }
+        }
+
+        for key in ["output", "content"] {
+            if let Some(child) = out.get(key).cloned() {
+                out.insert(
+                    key.to_string(),
+                    self.compress_openai_output_value(&child, &format!("{}.{}", path, key), audit),
+                );
+            }
+        }
+
+        serde_json::Value::Object(out)
     }
 
     fn make_event(

@@ -315,7 +315,7 @@ fn advance_ml(line: &str, mut state: Option<&'static str>, delims: &[&'static st
                 state = None;
                 continue;
             }
-            i += 1;
+            i += line[i..].chars().next().map_or(1, |c| c.len_utf8());
             continue;
         }
         let mut matched = None;
@@ -330,7 +330,7 @@ fn advance_ml(line: &str, mut state: Option<&'static str>, delims: &[&'static st
             i += m.len();
             continue;
         }
-        i += 1;
+        i += line[i..].chars().next().map_or(1, |c| c.len_utf8());
     }
     state
 }
